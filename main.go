@@ -82,6 +82,27 @@ type envelopeError struct {
 	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
+type hostCallError struct {
+	message    string
+	httpStatus int
+}
+
+// Error returns the CPA host callback error message
+func (e *hostCallError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+// StatusCode returns the upstream HTTP status preserved by CPA, or zero when unavailable
+func (e *hostCallError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.httpStatus
+}
+
 type registration struct {
 	SchemaVersion int                  `json:"schema_version"`
 	Capabilities  capabilities         `json:"capabilities"`
@@ -510,8 +531,15 @@ func callHost(method string, request any, result any) error {
 		return errors.New("host callback returned invalid JSON")
 	}
 	if !response.OK {
-		if response.Error != nil && response.Error.Message != "" {
-			return errors.New(response.Error.Message)
+		if response.Error != nil {
+			message := response.Error.Message
+			if message == "" {
+				message = "host callback failed"
+			}
+			return &hostCallError{
+				message:    message,
+				httpStatus: response.Error.HTTPStatus,
+			}
 		}
 		return errors.New("host callback failed")
 	}

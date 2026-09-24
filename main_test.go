@@ -20,16 +20,18 @@ const completedOK = "data: {\"type\":\"response.created\"}\n\n" +
 	"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n" +
 	"data: [DONE]\n\n"
 
+const completedJSON = `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}]}}`
+
 type fakeHost struct {
 	mu           sync.Mutex
 	files        []AuthFile
-	auth         map[string]json.RawMessage
-	requests     []HostHTTPRequest
+	runtimeAuth  map[string]RuntimeAuth
+	requests     []HostModelRequest
 	requestTimes []time.Time
 	logs         []string
 	status       int
 	body         []byte
-	httpErr      error
+	modelErr     error
 	listErr      error
 	block        chan struct{}
 	requestReady chan struct{}
@@ -41,17 +43,17 @@ func (h *fakeHost) ListAuthFiles(context.Context) ([]AuthFile, error) {
 	return append([]AuthFile(nil), h.files...), h.listErr
 }
 
-func (h *fakeHost) GetAuth(_ context.Context, authIndex string) (json.RawMessage, error) {
+func (h *fakeHost) GetRuntimeAuth(_ context.Context, authIndex string) (RuntimeAuth, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	raw, ok := h.auth[authIndex]
+	auth, ok := h.runtimeAuth[authIndex]
 	if !ok {
-		return nil, errors.New("not found")
+		return RuntimeAuth{}, errors.New("not found")
 	}
-	return append(json.RawMessage(nil), raw...), nil
+	return auth, nil
 }
 
-func (h *fakeHost) HTTPDo(ctx context.Context, request HostHTTPRequest) (HostHTTPResponse, error) {
+func (h *fakeHost) ExecuteModel(ctx context.Context, request HostModelRequest) (HostModelResponse, error) {
 	h.mu.Lock()
 	h.requests = append(h.requests, request)
 	h.requestTimes = append(h.requestTimes, time.Now())
@@ -59,7 +61,7 @@ func (h *fakeHost) HTTPDo(ctx context.Context, request HostHTTPRequest) (HostHTT
 	block := h.block
 	status := h.status
 	body := append([]byte(nil), h.body...)
-	httpErr := h.httpErr
+	modelErr := h.modelErr
 	h.mu.Unlock()
 	if ready != nil {
 		select {
@@ -71,19 +73,19 @@ func (h *fakeHost) HTTPDo(ctx context.Context, request HostHTTPRequest) (HostHTT
 		select {
 		case <-block:
 		case <-ctx.Done():
-			return HostHTTPResponse{}, ctx.Err()
+			return HostModelResponse{}, ctx.Err()
 		}
 	}
-	if httpErr != nil {
-		return HostHTTPResponse{}, httpErr
+	if modelErr != nil {
+		return HostModelResponse{}, modelErr
 	}
 	if status == 0 {
 		status = 200
 	}
 	if body == nil {
-		body = []byte(completedOK)
+		body = []byte(completedJSON)
 	}
-	return HostHTTPResponse{StatusCode: status, Body: body}, nil
+	return HostModelResponse{StatusCode: status, Body: body}, nil
 }
 
 func (h *fakeHost) Log(_ context.Context, level, message string, fields map[string]any) {
@@ -93,8 +95,8 @@ func (h *fakeHost) Log(_ context.Context, level, message string, fields map[stri
 	h.mu.Unlock()
 }
 
-func authJSON(index int, accountID string) json.RawMessage {
-	return json.RawMessage(fmt.Sprintf(`{"access_token":"secret-token-%d","account_id":%q,"email":"user-%d@example.com"}`, index, accountID, index))
+func runtimeAuthFor(index int) RuntimeAuth {
+	return RuntimeAuth{ID: fmt.Sprintf("auth-id-%d", index), Provider: probeProvider, Email: fmt.Sprintf("user-%d@example.com", index)}
 }
 
 func newConfiguredRuntime(t *testing.T, host Host) *Runtime {
@@ -133,10 +135,10 @@ func TestRunFiltersCodexAndPinsEveryAuthIndex(t *testing.T) {
 			{AuthIndex: "idx-1", Type: "codex", Email: "one@example.com"},
 			{AuthIndex: "idx-2", Type: "codex", Email: "two@example.com"},
 		},
-		auth: map[string]json.RawMessage{
-			"idx-1": authJSON(1, "shared-account"),
-			"idx-2": authJSON(2, "shared-account"),
-			"idx-3": authJSON(3, "different-account"),
+		runtimeAuth: map[string]RuntimeAuth{
+			"idx-1": runtimeAuthFor(1),
+			"idx-2": runtimeAuthFor(2),
+			"idx-3": runtimeAuthFor(3),
 		},
 	}
 	runtime := newConfiguredRuntime(t, host)
@@ -145,17 +147,23 @@ func TestRunFiltersCodexAndPinsEveryAuthIndex(t *testing.T) {
 		t.Fatalf("unexpected totals: %+v", record)
 	}
 	host.mu.Lock()
-	requests := append([]HostHTTPRequest(nil), host.requests...)
+	requests := append([]HostModelRequest(nil), host.requests...)
 	host.mu.Unlock()
 	if len(requests) != 3 {
 		t.Fatalf("got %d requests, want 3", len(requests))
 	}
-	var tokens []string
+	var authIDs []string
 	for _, request := range requests {
-		if request.URL != probeURL {
-			t.Errorf("unexpected URL %q", request.URL)
+		if request.EntryProtocol != probeProtocol || request.ExitProtocol != probeProtocol {
+			t.Errorf("protocols = %q/%q, want %q/%q", request.EntryProtocol, request.ExitProtocol, probeProtocol, probeProtocol)
 		}
-		tokens = append(tokens, request.Headers["Authorization"][0])
+		if request.ForcedProvider != probeProvider {
+			t.Errorf("forced provider = %q, want %q", request.ForcedProvider, probeProvider)
+		}
+		if request.Model != probeModel || request.Stream {
+			t.Errorf("model request = model %q stream %t, want %q and false", request.Model, request.Stream, probeModel)
+		}
+		authIDs = append(authIDs, request.AuthID)
 		var payload map[string]any
 		if err := json.Unmarshal(request.Body, &payload); err != nil {
 			t.Fatal(err)
@@ -163,19 +171,38 @@ func TestRunFiltersCodexAndPinsEveryAuthIndex(t *testing.T) {
 		if payload["model"] != probeModel {
 			t.Errorf("model = %v, want %s", payload["model"], probeModel)
 		}
-		if payload["stream"] != true {
-			t.Error("stream must be true")
+		if payload["stream"] != false {
+			t.Error("stream must be false")
 		}
 	}
-	sort.Strings(tokens)
-	wantTokens := []string{"Bearer secret-token-1", "Bearer secret-token-2", "Bearer secret-token-3"}
-	for index := range wantTokens {
-		if tokens[index] != wantTokens[index] {
-			t.Fatalf("tokens = %v, want %v", tokens, wantTokens)
+	sort.Strings(authIDs)
+	wantAuthIDs := []string{"auth-id-1", "auth-id-2", "auth-id-3"}
+	for index := range wantAuthIDs {
+		if authIDs[index] != wantAuthIDs[index] {
+			t.Fatalf("auth IDs = %v, want %v", authIDs, wantAuthIDs)
 		}
 	}
-	if record.Accounts[0].AccountID == "" || record.Accounts[1].AccountID == "" {
-		t.Fatal("account IDs should be reported")
+	for _, account := range record.Accounts {
+		if account.AccountID != "" {
+			t.Fatalf("account ID should no longer be populated: %+v", account)
+		}
+	}
+}
+
+func TestMissingRuntimeAuthIDDoesNotExecuteModel(t *testing.T) {
+	host := &fakeHost{
+		files:       []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
+		runtimeAuth: map[string]RuntimeAuth{"idx-1": {Provider: probeProvider}},
+	}
+	record := waitForRun(t, newConfiguredRuntime(t, host))
+	result := record.Accounts[0]
+	if result.ErrorCode != "credential_invalid" || result.Healthy {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if len(host.requests) != 0 {
+		t.Fatalf("model executed without an AuthID: %+v", host.requests)
 	}
 }
 
@@ -212,8 +239,8 @@ func TestParseCompletedResponse(t *testing.T) {
 
 func TestUnexpectedOutputIsResponseError(t *testing.T) {
 	host := &fakeHost{
-		files: []AuthFile{{AuthIndex: "idx-1", Type: "codex", Email: "one@example.com"}},
-		auth:  map[string]json.RawMessage{"idx-1": authJSON(1, "account")},
+		files:       []AuthFile{{AuthIndex: "idx-1", Type: "codex", Email: "one@example.com"}},
+		runtimeAuth: map[string]RuntimeAuth{"idx-1": runtimeAuthFor(1)},
 		body: []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"NO\"}\n\n" +
 			"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"),
 	}
@@ -238,9 +265,9 @@ func TestHTTPFailureClassification(t *testing.T) {
 	for _, test := range tests {
 		t.Run(fmt.Sprint(test.status), func(t *testing.T) {
 			host := &fakeHost{
-				files:  []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
-				auth:   map[string]json.RawMessage{"idx-1": authJSON(1, "account")},
-				status: test.status,
+				files:       []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
+				runtimeAuth: map[string]RuntimeAuth{"idx-1": runtimeAuthFor(1)},
+				status:      test.status,
 			}
 			record := waitForRun(t, newConfiguredRuntime(t, host))
 			result := record.Accounts[0]
@@ -253,19 +280,39 @@ func TestHTTPFailureClassification(t *testing.T) {
 
 func TestNetworkAndTimeoutClassification(t *testing.T) {
 	networkHost := &fakeHost{
-		files:   []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
-		auth:    map[string]json.RawMessage{"idx-1": authJSON(1, "account")},
-		httpErr: errors.New("dial failed"),
+		files:       []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
+		runtimeAuth: map[string]RuntimeAuth{"idx-1": runtimeAuthFor(1)},
+		modelErr:    errors.New("dial failed"),
 	}
 	network := waitForRun(t, newConfiguredRuntime(t, networkHost)).Accounts[0]
 	if network.ErrorCode != "network_error" {
 		t.Fatalf("network result: %+v", network)
 	}
 
+	rateLimitedHost := &fakeHost{
+		files:       []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
+		runtimeAuth: map[string]RuntimeAuth{"idx-1": runtimeAuthFor(1)},
+		modelErr:    errors.New("model execution failed with status 429"),
+	}
+	rateLimited := waitForRun(t, newConfiguredRuntime(t, rateLimitedHost)).Accounts[0]
+	if rateLimited.ErrorCode != "rate_limited" || rateLimited.HTTPStatus != 429 {
+		t.Fatalf("rate limited result: %+v", rateLimited)
+	}
+
+	unsupportedHost := &fakeHost{
+		files:       []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
+		runtimeAuth: map[string]RuntimeAuth{"idx-1": runtimeAuthFor(1)},
+		modelErr:    errors.New("unknown method: host.model.execute"),
+	}
+	unsupported := waitForRun(t, newConfiguredRuntime(t, unsupportedHost)).Accounts[0]
+	if unsupported.ErrorCode != "cpa_version_unsupported" || unsupported.Healthy {
+		t.Fatalf("unsupported CPA result: %+v", unsupported)
+	}
+
 	timeoutHost := &fakeHost{
-		files: []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
-		auth:  map[string]json.RawMessage{"idx-1": authJSON(1, "account")},
-		block: make(chan struct{}),
+		files:       []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
+		runtimeAuth: map[string]RuntimeAuth{"idx-1": runtimeAuthFor(1)},
+		block:       make(chan struct{}),
 	}
 	runtime := newConfiguredRuntime(t, timeoutHost)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -279,8 +326,8 @@ func TestNetworkAndTimeoutClassification(t *testing.T) {
 func TestSecretsDoNotEnterPersistenceOrLogs(t *testing.T) {
 	dir := t.TempDir()
 	host := &fakeHost{
-		files: []AuthFile{{AuthIndex: "idx-7", Type: "codex", Email: "safe@example.com"}},
-		auth:  map[string]json.RawMessage{"idx-7": authJSON(7, "safe-account")},
+		files:       []AuthFile{{AuthIndex: "idx-7", Type: "codex", Email: "safe@example.com"}},
+		runtimeAuth: map[string]RuntimeAuth{"idx-7": runtimeAuthFor(7)},
 	}
 	runtime := NewRuntime(host, dir)
 	if err := runtime.Configure("", false); err != nil {
@@ -300,7 +347,7 @@ func TestSecretsDoNotEnterPersistenceOrLogs(t *testing.T) {
 	combined.WriteString(strings.Join(host.logs, "\n"))
 	host.mu.Unlock()
 	text := combined.String()
-	for _, forbidden := range []string{"secret-token-7", "Authorization", "access_token", "refresh_token", "id_token"} {
+	for _, forbidden := range []string{"auth-id-7", "Authorization", "access_token", "account_id", "refresh_token", "id_token"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("persisted data or logs contain forbidden value %q", forbidden)
 		}
@@ -400,10 +447,10 @@ func TestScheduledRunAddsIndependentAccountJitter(t *testing.T) {
 			{AuthIndex: "idx-2", Type: "codex", Email: "two@example.com"},
 			{AuthIndex: "idx-3", Type: "codex", Email: "three@example.com"},
 		},
-		auth: map[string]json.RawMessage{
-			"idx-1": authJSON(1, "account-1"),
-			"idx-2": authJSON(2, "account-2"),
-			"idx-3": authJSON(3, "account-3"),
+		runtimeAuth: map[string]RuntimeAuth{
+			"idx-1": runtimeAuthFor(1),
+			"idx-2": runtimeAuthFor(2),
+			"idx-3": runtimeAuthFor(3),
 		},
 	}
 	runtime := newConfiguredRuntime(t, host)
@@ -464,7 +511,7 @@ func TestDailyScheduleMovesToNextDayAndRejectsTooManyTimes(t *testing.T) {
 func TestSingleFlightRejectsOverlappingRuns(t *testing.T) {
 	host := &fakeHost{
 		files:        []AuthFile{{AuthIndex: "idx-1", Type: "codex"}},
-		auth:         map[string]json.RawMessage{"idx-1": authJSON(1, "account")},
+		runtimeAuth:  map[string]RuntimeAuth{"idx-1": runtimeAuthFor(1)},
 		block:        make(chan struct{}),
 		requestReady: make(chan struct{}, 1),
 	}
@@ -530,9 +577,9 @@ func TestAccountsViewReconcilesDisabledState(t *testing.T) {
 			{AuthIndex: "idx-1", Type: "codex", Email: "one@example.com"},
 			{AuthIndex: "idx-2", Type: "codex", Email: "two@example.com", Disabled: true},
 		},
-		auth: map[string]json.RawMessage{
-			"idx-1": authJSON(1, "account-1"),
-			"idx-2": authJSON(2, "account-2"),
+		runtimeAuth: map[string]RuntimeAuth{
+			"idx-1": runtimeAuthFor(1),
+			"idx-2": runtimeAuthFor(2),
 		},
 	}
 	runtime := newConfiguredRuntime(t, host)
@@ -592,8 +639,8 @@ func TestAccountsViewUnavailableIsProbedNotDisabled(t *testing.T) {
 		files: []AuthFile{
 			{AuthIndex: "idx-1", Type: "codex", Email: "cool@example.com", Unavailable: true},
 		},
-		auth: map[string]json.RawMessage{
-			"idx-1": authJSON(1, "account-1"),
+		runtimeAuth: map[string]RuntimeAuth{
+			"idx-1": runtimeAuthFor(1),
 		},
 	}
 	runtime := newConfiguredRuntime(t, host)

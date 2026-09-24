@@ -8,6 +8,7 @@
 
 - 按 `auth_index` 独立检测每个 Codex 凭证，避免账号之间相互影响。
 - 固定使用 `gpt-5.6-luna` 发起最小探测请求。
+- 通过 CPA Plugin API 的 `host.auth.get_runtime` 和 `host.model.execute` 探测，固定使用 `forced_provider=codex` 及当前账号的 `AuthID`。
 - 同时校验 HTTP 状态、完整的 Responses/SSE 流以及最终输出 `OK`。
 - 区分未授权、额度异常、限流、超时、网络错误和上游错误等状态。
 - 支持按分钟间隔或每天固定时间自动检测。
@@ -17,7 +18,7 @@
 - 账号停用/启用状态实时同步：面板直接读取 CPA 的实时凭证状态，手动停用后立即显示已停用，重新启用后自动撤回过期的停用结果。CPA 的临时不可用标记（配额冷却、重启后 token 未加载等）不再被误判为停用，健康检测仍会照常独立探测，面板额外显示"冷却中"提示。
 - 内置响应式管理页面，适配桌面和手机浏览器。
 
-插件只读取探测所需的访问令牌，不会禁用、删除、刷新或改写凭证。令牌不会写入状态、历史、管理接口响应或日志。
+探测逻辑不读取或使用凭证中的 `access_token`、`account_id`，探测请求不需要 prefix、Management Key 或 CPA API Key。真实请求由 CPA 正常模型执行链发起，使用当前凭证配置的 `proxy_url`，并进入 CPA Usage / 调用记录；插件不会禁用、删除、刷新或改写凭证。管理页面和管理接口仍遵循 CPA 原有的管理员鉴权规则。
 
 ## 安装
 
@@ -25,6 +26,7 @@
 
 - 一台运行 `linux/arm64` 或 `linux/amd64` 的 CPA 主机。
 - CPA 已配置 Codex 凭证。
+- CPA Plugin API 版本至少为 `v7.3.3`，以支持 `host.model.execute` 的 `forced_provider` 和 `auth_id` 参数。
 - CPA 的 Management API 已启用，即 `remote-management.secret-key` 非空。
 - 使用预编译文件时不需要在 CPA 主机安装 Go 或 Docker。
 
@@ -211,7 +213,7 @@ POST /v0/management/plugins/codex-health-monitor/schedule
 - 插件存在但未启用：确认全局和实例两个 `enabled` 都为 `true`，然后查看 CPA 启动日志。
 - 页面返回 401：重新输入 `remote-management.secret-key` 对应的管理员密钥。
 - 没有账号：确认 CPA 中存在类型为 `codex` 的凭证，并检查 `target_emails` 是否过滤了全部账号。
-- 检测超时：确认 CPA 可以访问 `https://chatgpt.com`，必要时适当增加 `timeout_sec`。
+- 检测超时：确认 CPA 的 Codex 凭证及其 `proxy_url` 配置正常，并确认 CPA 版本至少为 `v7.3.3`；必要时适当增加 `timeout_sec`。
 
 ## 社区
 

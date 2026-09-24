@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +21,10 @@ import (
 
 const (
 	probeModel      = "gpt-5.6-luna"
-	probeURL        = "https://chatgpt.com/backend-api/codex/responses"
+	probeProvider   = "codex"
+	probeProtocol   = "codex"
+	minCPAPluginAPI = "v7.3.3"
+	cpaVersionError = "CPA Plugin API " + minCPAPluginAPI + " or newer is required for pinned model probes."
 	maxHistory      = 100
 	stateFileName   = "state.json"
 	historyFileName = "history.json"
@@ -49,8 +51,8 @@ var ErrRunInProgress = errors.New("health check already running")
 
 type Host interface {
 	ListAuthFiles(context.Context) ([]AuthFile, error)
-	GetAuth(context.Context, string) (json.RawMessage, error)
-	HTTPDo(context.Context, HostHTTPRequest) (HostHTTPResponse, error)
+	GetRuntimeAuth(context.Context, string) (RuntimeAuth, error)
+	ExecuteModel(context.Context, HostModelRequest) (HostModelResponse, error)
 	Log(context.Context, string, string, map[string]any)
 }
 
@@ -67,20 +69,29 @@ type AuthFile struct {
 	Unavailable bool   `json:"unavailable"`
 }
 
-type HostHTTPRequest struct {
-	Method  string              `json:"method"`
-	URL     string              `json:"url"`
-	Headers map[string][]string `json:"headers,omitempty"`
-	Body    []byte              `json:"body,omitempty"`
+type RuntimeAuth struct {
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	Email    string `json:"email"`
 }
 
-type HostHTTPResponse struct {
+type HostModelRequest struct {
+	EntryProtocol  string `json:"entry_protocol"`
+	ExitProtocol   string `json:"exit_protocol"`
+	Model          string `json:"model"`
+	Stream         bool   `json:"stream"`
+	Body           []byte `json:"body"`
+	ForcedProvider string `json:"forced_provider"`
+	AuthID         string `json:"auth_id"`
+}
+
+type HostModelResponse struct {
 	StatusCode int
 	Headers    map[string][]string
 	Body       []byte
 }
 
-func (r *HostHTTPResponse) UnmarshalJSON(data []byte) error {
+func (r *HostModelResponse) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		StatusCode      int                 `json:"StatusCode"`
 		StatusCodeSnake int                 `json:"status_code"`
@@ -120,37 +131,30 @@ func (realHost) ListAuthFiles(ctx context.Context) ([]AuthFile, error) {
 	return response.Files, nil
 }
 
-func (realHost) GetAuth(ctx context.Context, authIndex string) (json.RawMessage, error) {
+// GetRuntimeAuth resolves the CPA runtime credential for authIndex
+// It returns runtime metadata only and never reads the physical credential document
+func (realHost) GetRuntimeAuth(ctx context.Context, authIndex string) (RuntimeAuth, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return RuntimeAuth{}, err
 	}
 	var response struct {
-		JSON json.RawMessage `json:"json"`
-		Auth json.RawMessage `json:"auth"`
-		Data json.RawMessage `json:"data"`
+		Auth RuntimeAuth `json:"auth"`
 	}
-	if err := callHost("host.auth.get", map[string]any{"auth_index": authIndex}, &response); err != nil {
-		return nil, err
+	if err := callHost("host.auth.get_runtime", map[string]any{"auth_index": authIndex}, &response); err != nil {
+		return RuntimeAuth{}, err
 	}
-	if len(response.JSON) > 0 {
-		return response.JSON, nil
-	}
-	if len(response.Auth) > 0 {
-		return response.Auth, nil
-	}
-	if len(response.Data) > 0 {
-		return response.Data, nil
-	}
-	return nil, errors.New("empty auth document")
+	return response.Auth, nil
 }
 
-func (realHost) HTTPDo(ctx context.Context, request HostHTTPRequest) (HostHTTPResponse, error) {
+// ExecuteModel sends request through CPA's normal model execution chain
+// request identifies the model, provider and exact AuthID, and the return value is the non-streaming model response
+func (realHost) ExecuteModel(ctx context.Context, request HostModelRequest) (HostModelResponse, error) {
 	if err := ctx.Err(); err != nil {
-		return HostHTTPResponse{}, err
+		return HostModelResponse{}, err
 	}
-	var response HostHTTPResponse
-	if err := callHost("host.http.do", request, &response); err != nil {
-		return HostHTTPResponse{}, err
+	var response HostModelResponse
+	if err := callHost("host.model.execute", request, &response); err != nil {
+		return HostModelResponse{}, err
 	}
 	return response, nil
 }
@@ -775,12 +779,9 @@ func (r *Runtime) discoverAccounts(ctx context.Context, targetEmails string) ([]
 	return result, nil
 }
 
-type authMaterial struct {
-	AccessToken string `json:"access_token"`
-	AccountID   string `json:"account_id"`
-	Email       string `json:"email"`
-}
-
+// probeAccount checks one CPA credential through the model execution chain
+// parent controls cancellation, account identifies the exact auth index, and timeoutSec limits the probe duration
+// It returns the normalized account health result without exposing credential material
 func (r *Runtime) probeAccount(parent context.Context, account AuthFile, timeoutSec int) AccountResult {
 	started := time.Now()
 	result := AccountResult{
@@ -805,58 +806,53 @@ func (r *Runtime) probeAccount(parent context.Context, account AuthFile, timeout
 	}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
-	rawAuth, err := r.host.GetAuth(ctx, account.AuthIndex)
+
+	// 1. Resolve the exact CPA runtime AuthID for the account being checked
+	runtimeAuth, err := r.host.GetRuntimeAuth(ctx, account.AuthIndex)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return finish("timeout", "timeout", "The account check timed out.", false, 0)
 		}
-		return finish("credential_error", "credential_read_failed", "CPA could not read this credential.", false, 0)
+		if isUnsupportedHostAPIError(err) {
+			return finish("credential_error", "cpa_version_unsupported", cpaVersionError, false, 0)
+		}
+		return finish("credential_error", "credential_read_failed", "CPA could not resolve this runtime credential.", false, 0)
 	}
-	var material authMaterial
-	if json.Unmarshal(rawAuth, &material) != nil || strings.TrimSpace(material.AccessToken) == "" {
-		return finish("credential_error", "credential_invalid", "The credential does not contain a usable access token.", false, 0)
+	runtimeAuth.ID = strings.TrimSpace(runtimeAuth.ID)
+	if runtimeAuth.ID == "" {
+		return finish("credential_error", "credential_invalid", "The runtime credential does not contain an AuthID.", false, 0)
 	}
-	result.AccountID = material.AccountID
 	if result.Email == "" {
-		result.Email = material.Email
+		result.Email = runtimeAuth.Email
 	}
+
+	// 2. Execute a minimal model request pinned to the resolved AuthID
 	body, _ := json.Marshal(map[string]any{
 		"model":        probeModel,
-		"instructions": "Return exactly OK.",
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": "Reply with exactly OK"}},
-		}},
-		"stream":              true,
-		"store":               false,
-		"parallel_tool_calls": true,
-		"include":             []string{"reasoning.encrypted_content"},
-		"reasoning":           map[string]string{"effort": "low"},
+		"instructions": "Reply with exactly OK.",
+		"input":        "Reply with exactly OK",
+		"stream":       false,
+		"store":        false,
 	})
-	request := HostHTTPRequest{
-		Method: http.MethodPost,
-		URL:    probeURL,
-		Headers: map[string][]string{
-			"Authorization":      {"Bearer " + material.AccessToken},
-			"Content-Type":       {"application/json"},
-			"Accept":             {"text/event-stream"},
-			"Originator":         {"codex-tui"},
-			"Chatgpt-Account-Id": {material.AccountID},
-			"User-Agent":         {fmt.Sprintf("codex-tui/0.146.0 (Linux; %s)", runtime.GOARCH)},
-			"Connection":         {"keep-alive"},
-		},
-		Body: body,
+	request := HostModelRequest{
+		EntryProtocol:  probeProtocol,
+		ExitProtocol:   probeProtocol,
+		Model:          probeModel,
+		Stream:         false,
+		Body:           body,
+		ForcedProvider: probeProvider,
+		AuthID:         runtimeAuth.ID,
 	}
 	type responseResult struct {
-		response HostHTTPResponse
+		response HostModelResponse
 		err      error
 	}
 	responseCh := make(chan responseResult, 1)
 	go func() {
-		response, requestErr := r.host.HTTPDo(ctx, request)
+		response, requestErr := r.host.ExecuteModel(ctx, request)
 		responseCh <- responseResult{response: response, err: requestErr}
 	}()
-	var response HostHTTPResponse
+	var response HostModelResponse
 	select {
 	case <-ctx.Done():
 		return finish("timeout", "timeout", "The account check timed out.", false, 0)
@@ -864,6 +860,13 @@ func (r *Runtime) probeAccount(parent context.Context, account AuthFile, timeout
 		if outcome.err != nil {
 			if errors.Is(outcome.err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return finish("timeout", "timeout", "The account check timed out.", false, 0)
+			}
+			if isUnsupportedHostAPIError(outcome.err) {
+				return finish("credential_error", "cpa_version_unsupported", cpaVersionError, false, 0)
+			}
+			if status := errorHTTPStatus(outcome.err); status > 0 {
+				state, code, message := classifyHTTPStatus(status)
+				return finish(state, code, message, false, status)
 			}
 			return finish("network_error", "network_error", "CPA could not reach the Codex upstream service.", false, 0)
 		}
@@ -881,6 +884,45 @@ func (r *Runtime) probeAccount(parent context.Context, account AuthFile, timeout
 		return finish("response_error", "unexpected_output", "The completed response did not return the expected OK output.", false, response.StatusCode)
 	}
 	return finish("healthy", "", "", true, response.StatusCode)
+}
+
+// errorHTTPStatus extracts an HTTP status exposed by a CPA host callback error
+// It returns zero when the host did not preserve an upstream status code
+func errorHTTPStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	var statusError interface{ StatusCode() int }
+	if errors.As(err, &statusError) {
+		if status := statusError.StatusCode(); status > 0 {
+			return status
+		}
+	}
+	message := strings.ToLower(err.Error())
+	marker := "status "
+	index := strings.LastIndex(message, marker)
+	if index >= 0 {
+		fields := strings.Fields(message[index+len(marker):])
+		if len(fields) > 0 {
+			status, parseErr := strconv.Atoi(fields[0])
+			if parseErr == nil {
+				return status
+			}
+		}
+	}
+	return 0
+}
+
+// isUnsupportedHostAPIError reports whether err identifies a missing CPA host callback
+func isUnsupportedHostAPIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "host.") {
+		return false
+	}
+	return strings.Contains(message, "not found") || strings.Contains(message, "unknown method") || strings.Contains(message, "unsupported")
 }
 
 func classifyHTTPStatus(status int) (string, string, string) {
